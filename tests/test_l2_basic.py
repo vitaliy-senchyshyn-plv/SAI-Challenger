@@ -1,7 +1,10 @@
+import time
+
 import ipaddress
-import pytest
+
+from ptf.testutils import simple_tcp_packet, send_packet, verify_packets, verify_packet, verify_no_packet, \
+    verify_any_packet_any_port, verify_each_packet_on_each_port, simple_arp_packet
 from sai import SaiObjType
-from ptf.testutils import simple_tcp_packet, send_packet, verify_packets, verify_packet, verify_no_packet_any, verify_no_packet, verify_any_packet_any_port
 
 
 def test_l2_access_to_access_vlan(npu, dataplane):
@@ -711,3 +714,151 @@ def test_l2_mac_move_1(npu, dataplane):
             npu.set(npu.port_oids[idx], ["SAI_PORT_ATTR_PORT_VLAN_ID", npu.default_vlan_id])
         
         npu.remove(vlan_oid)
+
+
+def test_l2_db_aging_test(npu, dataplane):
+    """
+    Description:
+    Check access to access VLAN members forwarding
+    Test scenario:
+    1. Create a VLAN 10
+    2. Add three ports as untagged members to the VLAN
+    3. Send packet from port1 to port2 and verify on each of ports
+    4. Send packet from port2 to port1 and verify only on port1
+    5. Send packet from port2 to port1 and verify on each of ports
+    6. Clean up configuration
+    """
+    vlan_id = "10"
+    macs = ['00:11:11:11:11:11', '00:22:22:22:22:22']
+    max_port = 3
+    fdb_aging_time = 10
+    vlan_mbr_oids = []
+
+    vlan_oid = npu.create(SaiObjType.VLAN, ["SAI_VLAN_ATTR_VLAN_ID", vlan_id])
+
+    for idx in range(max_port):
+        npu.remove_vlan_member(npu.default_vlan_oid, npu.dot1q_bp_oids[idx])
+        vlan_mbr = npu.create_vlan_member(vlan_oid, npu.dot1q_bp_oids[idx], "SAI_VLAN_TAGGING_MODE_UNTAGGED")
+        vlan_mbr_oids.append(vlan_mbr)
+        npu.set(npu.port_oids[idx], ["SAI_PORT_ATTR_PORT_VLAN_ID", vlan_id])
+
+    try:
+        if npu.run_traffic:
+            pkt = simple_tcp_packet(eth_dst=macs[1],
+                                    eth_src=macs[0],
+                                    ip_dst='10.0.0.1',
+                                    ip_id=101,
+                                    ip_ttl=64)
+
+            pkt1 = simple_tcp_packet(eth_dst=macs[0],
+                                     eth_src=macs[1],
+                                     ip_dst='10.0.0.1',
+                                     ip_id=101,
+                                     ip_ttl=64)
+
+            send_packet(dataplane, 0, pkt)
+            verify_each_packet_on_each_port(dataplane, [pkt, pkt], [1, 2])
+
+            send_packet(dataplane, 1, pkt)
+            verify_packets(dataplane, pkt, [0])
+            time.sleep(fdb_aging_time + 2)
+
+            send_packet(dataplane, 1, pkt)
+            verify_each_packet_on_each_port(dataplane, [pkt1, pkt1], [0, 2])
+
+    finally:
+        for idx in range(max_port):
+            npu.remove(vlan_mbr_oids[idx])
+            npu.create_vlan_member(npu.default_vlan_oid, npu.dot1q_bp_oids[idx], "SAI_VLAN_TAGGING_MODE_UNTAGGED")
+            npu.set(npu.port_oids[idx], ["SAI_PORT_ATTR_PORT_VLAN_ID", npu.default_vlan_id])
+
+        npu.remove(vlan_oid)
+
+
+def test_l2_arp_request_reply_fdb_learning_test(npu, dataplane):
+    """
+    Description:
+    Check access to access VLAN members forwarding
+    Test scenario:
+    1. Create a VLAN 10
+    2. Add three ports as untagged members to the VLAN
+    3. Create virtual router
+    4. Send ARP request packet from port1 ...
+    5. Send ARP reply packet from port2 ...
+    5. Send packet from port2 to port1 and verify only on port1 (src_mac and dst_mac addresses are learned)
+    """
+    vlan_id = "10"
+    vrf_mac = '00:77:66:55:44:00'
+    max_port = 3
+    vlan_mbr_oids = []
+
+    vlan_oid = npu.create(SaiObjType.VLAN, ["SAI_VLAN_ATTR_VLAN_ID", vlan_id])
+
+    for idx in range(max_port):
+        npu.remove_vlan_member(npu.default_vlan_oid, npu.dot1q_bp_oids[idx])
+        vlan_mbr = npu.create_vlan_member(vlan_oid, npu.dot1q_bp_oids[idx], "SAI_VLAN_TAGGING_MODE_UNTAGGED")
+        vlan_mbr_oids.append(vlan_mbr)
+        npu.set(npu.port_oids[idx], ["SAI_PORT_ATTR_PORT_VLAN_ID", vlan_id])
+
+    vrf_oid = npu.create(SaiObjType.VIRTUAL_ROUTER, [])
+    npu.set(vrf_oid, ["SAI_VIRTUAL_ROUTER_ATTR_ADMIN_V4_STATE", "true"])
+    npu.set(vrf_oid, ["SAI_VIRTUAL_ROUTER_ATTR_ADMIN_V6_STATE", "true"])
+
+    rif_oid = npu.create(SaiObjType.ROUTER_INTERFACE, [
+                              'SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID', vrf_oid,
+                              'SAI_ROUTER_INTERFACE_ATTR_TYPE', 'SAI_ROUTER_INTERFACE_TYPE_VLAN',
+                              'SAI_ROUTER_INTERFACE_ATTR_VLAN_ID', vlan_oid,
+                              'SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS', vrf_mac,
+                              "SAI_ROUTER_INTERFACE_ATTR_ADMIN_V6_STATE", "true",
+                              'SAI_ROUTER_INTERFACE_ATTR_ADMIN_V4_STATE', "true",
+                          ])
+
+    try:
+        if npu.run_traffic:
+            arp_req_pkt = simple_arp_packet(eth_dst='ff:ff:ff:ff:ff:ff',
+                                            eth_src='00:11:11:11:11:11',
+                                            vlan_vid=10,
+                                            arp_op=1,  # ARP request
+                                            ip_snd='10.10.10.1',
+                                            ip_tgt='10.10.10.2',
+                                            hw_snd='00:11:11:11:11:11')
+
+            send_packet(dataplane, 0, str(arp_req_pkt))
+
+            time.sleep(1)
+            arp_rpl_pkt = simple_arp_packet(eth_dst=vrf_mac,
+                                            eth_src='00:11:22:33:44:55',
+                                            vlan_vid=10,
+                                            arp_op=2,  # ARP reply
+                                            ip_snd='10.10.10.2',
+                                            ip_tgt='10.10.10.1',
+                                            hw_snd=vrf_mac,
+                                            hw_tgt='00:11:22:33:44:55')
+
+            send_packet(dataplane, 1, str(arp_rpl_pkt))
+
+            pkt = simple_tcp_packet(eth_dst='00:11:11:11:11:11',
+                                    eth_src='00:11:22:33:44:55',
+                                    ip_dst='10.10.10.1',
+                                    ip_id=101,
+                                    ip_ttl=64)
+
+            time.sleep(1)
+
+            '#### Sending 00:11:11:11:11:11 | 00:11:22:33:44:55 | 10.10.10.1 | 10.10.10.2 | @ ptf_intf 2 ####'
+            send_packet(dataplane, 1, str(pkt))
+            verify_packets(dataplane, pkt, [0])
+
+    finally:
+        npu.flush_fdb_entries(
+            ["SAI_FDB_FLUSH_ATTR_BV_ID", vlan_oid, "SAI_FDB_FLUSH_ATTR_ENTRY_TYPE", "SAI_FDB_FLUSH_ENTRY_TYPE_ALL"])
+
+        npu.remove(rif_oid)
+        npu.remove(vrf_oid)
+
+        for idx in range(max_port):
+            npu.set(npu.port_oids[idx], ["SAI_PORT_ATTR_PORT_VLAN_ID", npu.default_vlan_id])
+            npu.remove(vlan_mbr_oids[idx])
+
+        npu.remove(vlan_oid)
+
